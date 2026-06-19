@@ -1,0 +1,4 @@
+feedparser>=6.0
+beautifulsoup4>=4.12
+anthropic>=0.34
+google-generativeai>=0.8
