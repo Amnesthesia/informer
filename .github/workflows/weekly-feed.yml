@@ -64,7 +64,7 @@ jobs:
           python rss_categorizer.py feeds.opml \
             --provider "$AI_PROVIDER" \
             --mode "$MODE" \
-            --rss-out feed.rss \
+            --rss-out rss.xml \
             $ARTICLE_FLAG
 
       - name: Commit and push feed
