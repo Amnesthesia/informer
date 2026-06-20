@@ -195,19 +195,23 @@ def _build_payload(articles: list[dict]) -> str:
     return _TASK_PROMPT + json.dumps(items, ensure_ascii=False, indent=2)
 
 
-def _repair_info(text: str, up_to: int) -> tuple[int, str]:
+def _repair_info(text: str, up_to: int) -> tuple[int, str, int]:
     """
     Single-pass, string-literal-aware scan of text[:up_to].
 
-    Returns (last_comma_pos, closing_suffix) where closing_suffix is the
-    exact sequence of `]` / `}` needed to close all containers open at the
-    moment of that comma — in correct nesting order (innermost first).
+    Returns (last_comma_pos, closing_suffix, string_start) where:
+    - last_comma_pos is the position of the last comma seen outside any string
+    - closing_suffix is the `]`/`}` sequence needed to close open containers
+      at that comma position (innermost first)
+    - string_start is the position where the current unclosed string started,
+      or -1 if not currently inside a string
     """
     in_string = False
     escaped = False
-    stack: list[str] = []       # "{" or "[" for each open container
+    stack: list[str] = []
     last_comma = -1
     comma_stack: list[str] = []
+    string_start = -1
 
     for i, ch in enumerate(text[:up_to]):
         if escaped:
@@ -217,7 +221,12 @@ def _repair_info(text: str, up_to: int) -> tuple[int, str]:
             escaped = True
             continue
         if ch == '"':
-            in_string = not in_string
+            if not in_string:
+                in_string = True
+                string_start = i
+            else:
+                in_string = False
+                string_start = -1
             continue
         if in_string:
             continue
@@ -234,7 +243,7 @@ def _repair_info(text: str, up_to: int) -> tuple[int, str]:
             stack.pop()
 
     closing = "".join("}" if c == "{" else "]" for c in reversed(comma_stack))
-    return last_comma, closing
+    return last_comma, closing, string_start
 
 
 def _extract_json(text: str) -> dict:
@@ -258,7 +267,10 @@ def _extract_json(text: str) -> dict:
     try:
         return json.loads(fragment)
     except json.JSONDecodeError as exc:
-        cut, closing = _repair_info(fragment, exc.pos)
+        cut, closing, string_start = _repair_info(fragment, exc.pos)
+        if cut == -1 and string_start > 0:
+            # Truncated inside a string value — try cutting before the string started
+            cut, closing, _ = _repair_info(fragment, string_start)
         if cut == -1:
             raise ValueError(f"Cannot repair JSON (no comma before error at pos {exc.pos})") from exc
         truncated = fragment[:cut]
@@ -273,55 +285,72 @@ def _extract_json(text: str) -> dict:
             raise ValueError(f"Could not repair truncated JSON: {exc2}") from exc2
 
 
+def _merge_ai_results(r1: dict, r2: dict) -> dict:
+    """Merge two AI result dicts ({"categories": {...}}) into one."""
+    merged: dict[str, dict] = {}
+    for result in (r1, r2):
+        for cat, cat_data in result.get("categories", {}).items():
+            if cat not in merged:
+                merged[cat] = {"synthesis": "", "articles": []}
+            merged[cat]["articles"].extend(cat_data.get("articles", []))
+            if not merged[cat]["synthesis"]:
+                merged[cat]["synthesis"] = cat_data.get("synthesis", "")
+    return {"categories": merged}
+
+
 class AIProvider:
     """Base class — subclasses implement `_call(prompt) -> str`."""
 
-    BATCH_SIZE = 15  # articles per API call — keeps response within 8 k output tokens
+    BATCH_SIZE = 8  # articles per API call
 
     def _call(self, prompt: str) -> str:
         raise NotImplementedError
 
+    def _run_batch(self, id_offset: int, batch: list[dict]) -> dict:
+        """Run one batch; on failure, split in half and retry recursively."""
+        prompt = _build_payload(batch)
+        try:
+            raw = self._call(prompt)
+            result = _extract_json(raw)
+        except Exception as exc:
+            if len(batch) > 1:
+                print(
+                    f"[warn] batch at article {id_offset} (n={len(batch)}) failed, splitting: {exc}",
+                    file=sys.stderr,
+                )
+                mid = len(batch) // 2
+                return _merge_ai_results(
+                    self._run_batch(id_offset, batch[:mid]),
+                    self._run_batch(id_offset + mid, batch[mid:]),
+                )
+            print(
+                f"[warn] single-article batch at {id_offset} failed: {exc}",
+                file=sys.stderr,
+            )
+            return {"categories": {}}
+        for cat_data in result.get("categories", {}).values():
+            for art in cat_data.get("articles", []):
+                art["id"] += id_offset
+        return result
+
     def analyze(self, articles: list[dict]) -> dict:
         """
-        Send articles to the model in batches concurrently and merge the results.
-        Returns the canonical AI result dict: {"categories": {...}}.
+        Send articles in parallel batches; merge and return {"categories": {...}}.
+        Failed batches are automatically split in half and retried.
         """
         batches = [
             articles[i : i + self.BATCH_SIZE]
             for i in range(0, len(articles), self.BATCH_SIZE)
         ]
-        jobs = [
-            (i * self.BATCH_SIZE, batch, _build_payload(batch))
-            for i, batch in enumerate(batches)
-        ]
-
-        def _run(id_offset: int, batch: list[dict], prompt: str) -> dict:
-            try:
-                raw = self._call(prompt)
-                result = _extract_json(raw)
-            except Exception as exc:
-                print(
-                    f"[warn] AI batch starting at article {id_offset} failed: {exc}",
-                    file=sys.stderr,
-                )
-                result = {"categories": {}}
-            for cat_data in result.get("categories", {}).values():
-                for art in cat_data.get("articles", []):
-                    art["id"] += id_offset
-            return result
-
-        merged: dict[str, dict] = {}
+        result: dict = {"categories": {}}
         with concurrent.futures.ThreadPoolExecutor() as pool:
-            futures = [pool.submit(_run, off, b, p) for off, b, p in jobs]
+            futures = [
+                pool.submit(self._run_batch, i * self.BATCH_SIZE, batch)
+                for i, batch in enumerate(batches)
+            ]
             for fut in concurrent.futures.as_completed(futures):
-                for cat, cat_data in fut.result().get("categories", {}).items():
-                    if cat not in merged:
-                        merged[cat] = {"synthesis": "", "articles": []}
-                    merged[cat]["articles"].extend(cat_data.get("articles", []))
-                    if not merged[cat]["synthesis"]:
-                        merged[cat]["synthesis"] = cat_data.get("synthesis", "")
-
-        return {"categories": merged}
+                result = _merge_ai_results(result, fut.result())
+        return result
 
 
 class ClaudeProvider(AIProvider):
@@ -362,7 +391,7 @@ class GeminiProvider(AIProvider):
             contents=prompt,
             config=types.GenerateContentConfig(
                 system_instruction=SYSTEM_PROMPT,
-                max_output_tokens=8192,
+                max_output_tokens=65536,
             ),
         )
         return response.text
