@@ -354,6 +354,8 @@ class AIProvider:
 
 
 class ClaudeProvider(AIProvider):
+    BATCH_SIZE = 5  # 8k output token cap; small batches prevent synthesis-induced truncation
+
     def __init__(self, model: str = "claude-sonnet-4-6") -> None:
         import anthropic  # lazy import so Gemini-only installs work
 
@@ -374,6 +376,8 @@ class ClaudeProvider(AIProvider):
 
 
 class GeminiProvider(AIProvider):
+    BATCH_SIZE = 20  # 65k output token cap; larger batches are safe
+
     def __init__(self, model: str = "gemini-2.5-flash") -> None:
         from google import genai  # lazy import — requires google-genai package
 
