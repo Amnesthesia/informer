@@ -152,7 +152,7 @@ Analyze the articles below and return a single JSON object with this exact schem
       "articles": [
         {
           "id": <integer, matches the id field in the input>,
-          "summary": ["• <insight>", "• <insight>", ...],
+          "summary": ["• <insight>", "• <insight>", "• <insight>"],
           "relevance_tier": <1 | 2 | 3>,
           "tags": ["<topic>", ...]
         }
@@ -162,15 +162,18 @@ Analyze the articles below and return a single JSON object with this exact schem
 }
 
 Rules:
-• Derive categories organically from content — do not use a fixed list.
+• Create at most 8 broad thematic categories. Group related articles together — do NOT create a separate category per article or per source. Aim for 3–15 articles per category.
 • Each article must appear in exactly one category.
-• summary: 3-5 bullet points starting with "•", each ≤ 25 words.
+• summary: exactly 3 bullet points starting with "•", each ≤ 20 words.
 • relevance_tier: 1 = must-read, 2 = worthwhile, 3 = low-priority.
-• Within each category, order articles ascending by relevance_tier (most important first).
-• tags: 3-6 concise topic keywords.
+• Within each category, order articles by relevance_tier ascending (1 first).
+• tags: 3-5 concise topic keywords.
 
 Articles:
 """
+
+
+_BATCH_CONTENT_CHARS = 800  # per-article content limit inside a batch request
 
 
 def _build_payload(articles: list[dict]) -> str:
@@ -178,7 +181,7 @@ def _build_payload(articles: list[dict]) -> str:
         {
             "id": i,
             "title": a["title"],
-            "content": a["content"] or a["description"],
+            "content": (a["content"] or a["description"])[:_BATCH_CONTENT_CHARS],
             "source": a["source"],
         }
         for i, a in enumerate(articles)
@@ -186,22 +189,88 @@ def _build_payload(articles: list[dict]) -> str:
     return TASK_PROMPT + json.dumps(items, ensure_ascii=False, indent=2)
 
 
+def _repair_info(text: str, up_to: int) -> tuple[int, str]:
+    """
+    Single-pass, string-literal-aware scan of text[:up_to].
+
+    Returns (last_comma_pos, closing_suffix) where closing_suffix is the
+    exact sequence of `]` / `}` needed to close all containers open at the
+    moment of that comma — in correct nesting order (innermost first).
+    """
+    in_string = False
+    escaped = False
+    stack: list[str] = []       # "{" or "[" for each open container
+    last_comma = -1
+    comma_stack: list[str] = []
+
+    for i, ch in enumerate(text[:up_to]):
+        if escaped:
+            escaped = False
+            continue
+        if ch == "\\" and in_string:
+            escaped = True
+            continue
+        if ch == '"':
+            in_string = not in_string
+            continue
+        if in_string:
+            continue
+        if ch == ",":
+            last_comma = i
+            comma_stack = stack.copy()
+        elif ch == "{":
+            stack.append("{")
+        elif ch == "}" and stack and stack[-1] == "{":
+            stack.pop()
+        elif ch == "[":
+            stack.append("[")
+        elif ch == "]" and stack and stack[-1] == "[":
+            stack.pop()
+
+    closing = "".join("}" if c == "{" else "]" for c in reversed(comma_stack))
+    return last_comma, closing
+
+
 def _extract_json(text: str) -> dict:
-    """Pull the first {...} JSON object out of a model response."""
-    # Strip markdown fences if present
+    """
+    Parse a JSON object from model output.
+
+    Handles two common failure modes:
+    - Markdown fences wrapping the JSON
+    - Response truncated mid-object (output token limit hit): cuts at the last
+      comma outside any string literal, then closes open brackets/braces using
+      the depth recorded at that exact comma position.
+    """
     clean = re.sub(r"^```(?:json)?\s*", "", text.strip(), flags=re.IGNORECASE)
     clean = re.sub(r"\s*```$", "", clean.strip())
+
     start = clean.find("{")
-    end = clean.rfind("}") + 1
-    if start == -1 or end == 0:
+    if start == -1:
         raise ValueError("No JSON object found in model response")
-    return json.loads(clean[start:end])
+    fragment = clean[start:]
+
+    try:
+        return json.loads(fragment)
+    except json.JSONDecodeError as exc:
+        cut, closing = _repair_info(fragment, exc.pos)
+        if cut == -1:
+            raise ValueError(f"Cannot repair JSON (no comma before error at pos {exc.pos})") from exc
+        truncated = fragment[:cut]
+        try:
+            result = json.loads(truncated + closing)
+            print(
+                f"[warn] Repaired truncated JSON (trimmed at char {cut}, added {closing!r})",
+                file=sys.stderr,
+            )
+            return result
+        except json.JSONDecodeError as exc2:
+            raise ValueError(f"Could not repair truncated JSON: {exc2}") from exc2
 
 
 class AIProvider:
     """Base class — subclasses implement `_call(prompt) -> str`."""
 
-    BATCH_SIZE = 30  # articles per API call
+    BATCH_SIZE = 15  # articles per API call — keeps response within 8 k output tokens
 
     def _call(self, prompt: str) -> str:
         raise NotImplementedError
@@ -260,7 +329,7 @@ class ClaudeProvider(AIProvider):
 
 
 class GeminiProvider(AIProvider):
-    def __init__(self, model: str = "gemini-2.0-flash") -> None:
+    def __init__(self, model: str = "gemini-2.5-flash") -> None:
         from google import genai  # lazy import — requires google-genai package
 
         api_key = os.environ.get("GOOGLE_API_KEY")
