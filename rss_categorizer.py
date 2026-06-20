@@ -261,19 +261,25 @@ class ClaudeProvider(AIProvider):
 
 class GeminiProvider(AIProvider):
     def __init__(self, model: str = "gemini-2.0-flash") -> None:
-        import google.generativeai as genai  # lazy import
+        from google import genai  # lazy import — requires google-genai package
 
         api_key = os.environ.get("GOOGLE_API_KEY")
         if not api_key:
             sys.exit("Error: GOOGLE_API_KEY is not set.")
-        genai.configure(api_key=api_key)
-        self.model_obj = genai.GenerativeModel(
-            model,
-            system_instruction=SYSTEM_PROMPT,
-        )
+        self.client = genai.Client(api_key=api_key)
+        self.model = model
 
     def _call(self, prompt: str) -> str:
-        response = self.model_obj.generate_content(prompt)
+        from google.genai import types
+
+        response = self.client.models.generate_content(
+            model=self.model,
+            contents=prompt,
+            config=types.GenerateContentConfig(
+                system_instruction=SYSTEM_PROMPT,
+                max_output_tokens=8192,
+            ),
+        )
         return response.text
 
 
