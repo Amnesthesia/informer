@@ -35,20 +35,86 @@ def _slug(text: str) -> str:
     return re.sub(r"[^\w\s-]", "", text.lower()).strip().replace(" ", "-")
 
 
-def _bullets_from_html(html: str) -> list[str]:
-    """Extract <li> text from an HTML fragment, stripping leading bullet chars."""
+def _prose_from_html(html: str) -> str:
+    """Extract the prose summary paragraph from an individual article description."""
+    if not html:
+        return ""
+    soup = BeautifulSoup(html, "html.parser")
+    for p in soup.find_all("p"):
+        text = p.get_text(" ", strip=True)
+        # Skip the meta line (contains "Category:" / "Relevance:" / "Source:")
+        if "Category:" in text or "Relevance:" in text:
+            continue
+        # Skip the "Read full article" link paragraph
+        if "Read" in text and "article" in text:
+            continue
+        if text:
+            return text
+    # Fallback: return all text stripped of HTML
+    return soup.get_text(" ", strip=True)
+
+
+def _articles_from_digest_html(html: str, cat_name: str) -> list[dict]:
+    """
+    Parse the HTML description of a category digest item into a list of article dicts
+    matching the shape expected by render_markdown().
+
+    The digest HTML structure (produced by build_rss) is:
+        <h2>Category</h2>
+        <ul>
+          <li>
+            <strong>★★★ <a href="URL">Title</a></strong> — <em>Source</em><br/>
+            Prose summary...<br/>
+            <a href="URL">Read more →</a>
+          </li>
+          ...
+        </ul>
+    """
     if not html:
         return []
     soup = BeautifulSoup(html, "html.parser")
-    results = []
-    for li in soup.find_all("li"):
-        # Only grab direct-child lis (not nested ones inside category digests)
-        if li.find_parent("li"):
+    ul = soup.find("ul")
+    if not ul:
+        return []
+
+    articles = []
+    for li in ul.find_all("li", recursive=False):
+        a = li.find("a")
+        if not a:
             continue
-        text = li.get_text(" ", strip=True).lstrip("•").strip()
-        if text:
-            results.append(text)
-    return results
+        title = a.get_text(strip=True)
+        url = a.get("href", "")
+
+        em = li.find("em")
+        source = em.get_text(strip=True) if em else ""
+
+        # Stars in the text node determine relevance tier
+        full_text = li.get_text(" ")
+        tier = 3
+        if "★★★" in full_text:
+            tier = 1
+        elif "★★" in full_text:
+            tier = 2
+
+        # Prose summary: all text in <li> minus the strong (title+stars) and links
+        # Grab text nodes that are direct children of the <li> or its <br/> siblings
+        for tag in li.find_all(["strong", "a", "em"]):
+            tag.decompose()
+        prose = li.get_text(" ", strip=True).strip("— ").strip()
+
+        articles.append(
+            {
+                "title": title,
+                "url": url,
+                "source": source,
+                "published": "",
+                "category": cat_name,
+                "tier": tier,
+                "topics": [],
+                "prose": prose,
+            }
+        )
+    return articles
 
 
 # ─── RSS parsing ──────────────────────────────────────────────────────────────
@@ -91,7 +157,11 @@ def parse_feed(path: str) -> tuple[dict, list[dict]]:
 
     Returns:
         meta     — channel-level metadata dict
-        articles — list of article dicts (category digest items are skipped)
+        articles — list of article dicts
+
+    When the feed contains only category digest items (category-only mode, the
+    default), falls back to extracting articles from the digest HTML so the
+    markdown renderer has data to work with.
     """
     tree = ET.parse(path)
     channel = tree.getroot().find("channel")
@@ -105,16 +175,17 @@ def parse_feed(path: str) -> tuple[dict, list[dict]]:
     }
 
     articles: list[dict] = []
+    digest_items: list[ET.Element] = []
+
     for item in channel.findall("item"):
         guid = item.findtext("guid", "")
-        # Category digest summary entries are identified by their guid prefix
         if guid.startswith("digest:"):
+            digest_items.append(item)
             continue
 
         category, tier, source, topics = _parse_categories(item)
-
         desc_el = item.find("description")
-        bullets = _bullets_from_html(desc_el.text if desc_el is not None else "")
+        prose = _prose_from_html(desc_el.text if desc_el is not None else "")
 
         articles.append(
             {
@@ -125,9 +196,20 @@ def parse_feed(path: str) -> tuple[dict, list[dict]]:
                 "category": category or "Uncategorised",
                 "tier": tier,
                 "topics": topics,
-                "bullets": bullets,
+                "prose": prose,
             }
         )
+
+    # Category-only feed — parse articles out of digest item descriptions
+    if not articles:
+        for item in digest_items:
+            cat_name = next(
+                (el.text for el in item.findall("category") if el.text), ""
+            )
+            desc_el = item.find("description")
+            articles.extend(
+                _articles_from_digest_html(desc_el.text or "", cat_name)
+            )
 
     return meta, articles
 
@@ -183,11 +265,10 @@ def render_markdown(meta: dict, articles: list[dict]) -> str:
                 "",
             ]
 
-            # Bullet summary
-            if art["bullets"]:
-                for b in art["bullets"]:
-                    lines.append(f"- {b}")
-                lines.append("")
+            # Prose summary
+            prose = art.get("prose", "")
+            if prose:
+                lines += [prose, ""]
 
             # Topic tags
             if art["topics"]:

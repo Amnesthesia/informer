@@ -143,7 +143,7 @@ SYSTEM_PROMPT = (
     "Respond only with the JSON object requested — no prose, no markdown fences."
 )
 
-TASK_PROMPT = """\
+_TASK_PROMPT_SCHEMA = """\
 Analyze the articles below and return a single JSON object with this exact schema:
 
 {
@@ -152,7 +152,7 @@ Analyze the articles below and return a single JSON object with this exact schem
       "articles": [
         {
           "id": <integer, matches the id field in the input>,
-          "summary": ["• <insight>", "• <insight>", "• <insight>"],
+          "summary": "<prose paragraph>",
           "relevance_tier": <1 | 2 | 3>,
           "tags": ["<topic>", ...]
         }
@@ -164,19 +164,31 @@ Analyze the articles below and return a single JSON object with this exact schem
 Rules:
 • Create at most 8 broad thematic categories. Group related articles together — do NOT create a separate category per article or per source. Aim for 3–15 articles per category.
 • Each article must appear in exactly one category.
-• summary: exactly 3 bullet points starting with "•", each ≤ 20 words.
 • relevance_tier: 1 = must-read, 2 = worthwhile, 3 = low-priority.
 • Within each category, order articles by relevance_tier ascending (1 first).
 • tags: 3-5 concise topic keywords.
-
-Articles:
 """
+
+# Used by default (category-only mode) — richer prose since this is the only content readers see.
+_TASK_PROMPT_DETAILED = (
+    _TASK_PROMPT_SCHEMA
+    + "• summary: a prose paragraph of 3-4 sentences covering the key insight, broader context, "
+    "and main takeaway. Write in complete sentences — no bullet points.\n\nArticles:\n"
+)
+
+# Used when --include-articles is set — shorter since individual entries also appear.
+_TASK_PROMPT_BRIEF = (
+    _TASK_PROMPT_SCHEMA
+    + "• summary: a prose paragraph of 1-2 sentences capturing the core insight. "
+    "Write in complete sentences — no bullet points.\n\nArticles:\n"
+)
 
 
 _BATCH_CONTENT_CHARS = 800  # per-article content limit inside a batch request
 
 
-def _build_payload(articles: list[dict]) -> str:
+def _build_payload(articles: list[dict], detailed: bool = True) -> str:
+    prompt = _TASK_PROMPT_DETAILED if detailed else _TASK_PROMPT_BRIEF
     items = [
         {
             "id": i,
@@ -186,7 +198,7 @@ def _build_payload(articles: list[dict]) -> str:
         }
         for i, a in enumerate(articles)
     ]
-    return TASK_PROMPT + json.dumps(items, ensure_ascii=False, indent=2)
+    return prompt + json.dumps(items, ensure_ascii=False, indent=2)
 
 
 def _repair_info(text: str, up_to: int) -> tuple[int, str]:
@@ -275,7 +287,7 @@ class AIProvider:
     def _call(self, prompt: str) -> str:
         raise NotImplementedError
 
-    def analyze(self, articles: list[dict]) -> dict:
+    def analyze(self, articles: list[dict], detailed: bool = True) -> dict:
         """
         Send articles to the model in batches and merge the category results.
         Returns the canonical AI result dict: {"categories": {...}}.
@@ -287,7 +299,7 @@ class AIProvider:
             batch = articles[batch_start : batch_start + self.BATCH_SIZE]
             # Re-index within the batch so IDs start at 0 each time
             indexed_batch = [dict(a, _batch_idx=i) for i, a in enumerate(batch)]
-            prompt = _build_payload(indexed_batch)
+            prompt = _build_payload(indexed_batch, detailed=detailed)
 
             try:
                 raw = self._call(prompt)
@@ -389,7 +401,7 @@ def assemble_output(
             enriched.append(
                 {
                     "title": orig["title"],
-                    "summary": ai_art.get("summary", []),
+                    "summary": ai_art.get("summary", ""),
                     "source": orig["source"],
                     "url": orig["url"],
                     "published": orig["published"],
@@ -449,7 +461,7 @@ def _html_el(
     return el
 
 
-def build_rss(output: dict) -> str:
+def build_rss(output: dict, include_articles: bool = False) -> str:
     """Convert the assembled JSON output into a pretty-printed RSS 2.0 string."""
     impl = minidom.getDOMImplementation()
     doc = impl.createDocument(None, "rss", None)
@@ -473,67 +485,70 @@ def build_rss(output: dict) -> str:
     _el(doc, channel, "generator", "rss_categorizer / AI-powered")
 
     # ── 1. Category digest entries (one per category) ────────────────────────
+    date_label = dr["start"] if mode == "daily" else f"{dr['start']} to {dr['end']}"
+
     for cat_name, articles in output["categories"].items():
         item = doc.createElement("item")
         channel.appendChild(item)
 
-        _el(doc, item, "title", f"[{cat_name}] — {mode.capitalize()} digest {dr['start']}")
-        _el(doc, item, "guid", f"digest:{cat_name}:{dr['start']}")
+        _el(doc, item, "title", f"[{cat_name}] — {mode.capitalize()} digest {date_label}")
+        _el(doc, item, "guid", f"digest:{cat_name}:{dr['start']}:{dr['end']}")
         _el(doc, item, "pubDate", now_str)
         _el(doc, item, "category", cat_name)
         _el(doc, item, "dc:creator", "AI Categorizer")
 
-        lines = [f"<h2>{cat_name}</h2>", "<ol>"]
+        lines = [f"<h2>{cat_name}</h2>", "<ul>"]
         for art in articles:
             tier = art["tags"]["relevance_tier"]
             stars = _TIER_STARS.get(tier, "")
-            bullets = "".join(f"<li>{b}</li>" for b in art.get("summary", []))
+            summary = art.get("summary", "")
             lines.append(
-                f'<li>'
-                f'{stars} <a href="{art["url"]}">{art["title"]}</a>'
-                f' &mdash; <em>{art["source"]}</em>'
-                f"<ul>{bullets}</ul>"
+                f"<li>"
+                f"<strong>{stars} <a href=\"{art['url']}\">{art['title']}</a></strong>"
+                f" &mdash; <em>{art['source']}</em><br/>"
+                f"{summary}<br/>"
+                f"<a href=\"{art['url']}\">Read more →</a>"
                 f"</li>"
             )
-        lines.append("</ol>")
+        lines.append("</ul>")
         _html_el(doc, item, "description", "\n".join(lines))
 
-    # ── 2. Individual article entries (sorted by relevance tier ascending) ───
-    flat: list[tuple[int, str, dict]] = []
-    for cat_name, articles in output["categories"].items():
-        for art in articles:
-            flat.append((art["tags"]["relevance_tier"], cat_name, art))
-    flat.sort(key=lambda t: t[0])
+    # ── 2. Individual article entries (only when --include-articles is set) ──
+    if include_articles:
+        flat: list[tuple[int, str, dict]] = []
+        for cat_name, articles in output["categories"].items():
+            for art in articles:
+                flat.append((art["tags"]["relevance_tier"], cat_name, art))
+        flat.sort(key=lambda t: t[0])
 
-    for tier, cat_name, art in flat:
-        item = doc.createElement("item")
-        channel.appendChild(item)
+        for tier, cat_name, art in flat:
+            item = doc.createElement("item")
+            channel.appendChild(item)
 
-        _el(doc, item, "title", art["title"])
-        _el(doc, item, "link", art["url"])
-        _el(doc, item, "guid", art["url"])
-        _el(doc, item, "pubDate", _rfc2822(art["published"], now_str))
-        _el(doc, item, "source", art["source"])
-        _el(doc, item, "dc:creator", art["source"])
+            _el(doc, item, "title", art["title"])
+            _el(doc, item, "link", art["url"])
+            _el(doc, item, "guid", art["url"])
+            _el(doc, item, "pubDate", _rfc2822(art["published"], now_str))
+            _el(doc, item, "source", art["source"])
+            _el(doc, item, "dc:creator", art["source"])
 
-        # Category tags: detected category, relevance tier, source feed
-        _el(doc, item, "category", cat_name)
-        _el(doc, item, "category", f"relevance:tier{tier}")
-        _el(doc, item, "category", f"source:{art['source']}")
-        for topic in art["tags"].get("topics", []):
-            _el(doc, item, "category", topic)
+            # Category tags: detected category, relevance tier, source feed
+            _el(doc, item, "category", cat_name)
+            _el(doc, item, "category", f"relevance:tier{tier}")
+            _el(doc, item, "category", f"source:{art['source']}")
+            for topic in art["tags"].get("topics", []):
+                _el(doc, item, "category", topic)
 
-        bullets = "".join(f"<li>{b}</li>" for b in art.get("summary", []))
-        desc_html = (
-            f"<p>"
-            f"<strong>Category:</strong> {cat_name} &nbsp;|&nbsp; "
-            f"<strong>Relevance:</strong> {_TIER_LABEL.get(tier, '')} ({_TIER_STARS.get(tier, '')}) &nbsp;|&nbsp; "
-            f"<strong>Source:</strong> {art['source']}"
-            f"</p>"
-            f"<ul>{bullets}</ul>"
-            f'<p><a href="{art["url"]}">Read full article →</a></p>'
-        )
-        _html_el(doc, item, "description", desc_html)
+            desc_html = (
+                f"<p>"
+                f"<strong>Category:</strong> {cat_name} &nbsp;|&nbsp; "
+                f"<strong>Relevance:</strong> {_TIER_LABEL.get(tier, '')} ({_TIER_STARS.get(tier, '')}) &nbsp;|&nbsp; "
+                f"<strong>Source:</strong> {art['source']}"
+                f"</p>"
+                f"<p>{art.get('summary', '')}</p>"
+                f'<p><a href="{art["url"]}">Read full article →</a></p>'
+            )
+            _html_el(doc, item, "description", desc_html)
 
     return doc.toprettyxml(indent="  ", encoding=None)
 
@@ -567,6 +582,13 @@ def parse_args() -> argparse.Namespace:
     )
     p.add_argument("--json-out", metavar="FILE", help="Write JSON result to FILE (default: stdout)")
     p.add_argument("--rss-out", metavar="FILE", help="Write RSS XML to FILE (default: not written)")
+    include_default = os.environ.get("INCLUDE_ARTICLES", "").lower() in ("1", "true", "yes")
+    p.add_argument(
+        "--include-articles",
+        action="store_true",
+        default=include_default,
+        help="Append individual article entries below category digests  [env: INCLUDE_ARTICLES]",
+    )
     return p.parse_args()
 
 
@@ -601,7 +623,7 @@ def main() -> None:
     # ── AI analysis ───────────────────────────────────────────────────────────
     provider = make_provider(args.provider)
     print(f"[info] Sending {len(articles)} articles to {args.provider} …", file=sys.stderr)
-    ai_result = provider.analyze(articles)
+    ai_result = provider.analyze(articles, detailed=not args.include_articles)
 
     # ── Assemble JSON output ──────────────────────────────────────────────────
     output = assemble_output(articles, ai_result, args.mode, cutoff, now)
@@ -616,7 +638,7 @@ def main() -> None:
 
     # ── Build RSS ─────────────────────────────────────────────────────────────
     if args.rss_out:
-        rss_str = build_rss(output)
+        rss_str = build_rss(output, include_articles=args.include_articles)
         with open(args.rss_out, "w", encoding="utf-8") as fh:
             fh.write(rss_str)
         print(f"[info] RSS written to {args.rss_out}", file=sys.stderr)

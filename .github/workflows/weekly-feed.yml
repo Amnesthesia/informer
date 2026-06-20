@@ -17,6 +17,11 @@ on:
         default: 'claude'
         type: choice
         options: [claude, gemini]
+      include_articles:
+        description: 'Include individual article entries below category digests'
+        required: false
+        default: false
+        type: boolean
 
 permissions:
   contents: write
@@ -54,10 +59,13 @@ jobs:
           ANTHROPIC_API_KEY: ${{ secrets.ANTHROPIC_API_KEY }}
           GOOGLE_API_KEY: ${{ secrets.GOOGLE_API_KEY }}
         run: |
+          ARTICLE_FLAG=""
+          if [ "${{ inputs.include_articles }}" = "true" ]; then ARTICLE_FLAG="--include-articles"; fi
           python rss_categorizer.py feeds.opml \
             --provider "$AI_PROVIDER" \
             --mode "$MODE" \
-            --rss-out feed.rss
+            --rss-out feed.rss \
+            $ARTICLE_FLAG
 
       - name: Commit and push feed
         run: |
