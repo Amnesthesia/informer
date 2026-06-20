@@ -2,23 +2,23 @@ name: Weekly RSS Feed
 
 on:
   schedule:
-    - cron: '0 6 * * 1'  # Every Monday 06:00 UTC
+    - cron: "0 6 * * 1" # Every Monday 06:00 UTC
   workflow_dispatch:
     inputs:
       mode:
-        description: 'Date window'
+        description: "Date window"
         required: false
-        default: 'weekly'
+        default: "weekly"
         type: choice
         options: [weekly, daily]
       provider:
-        description: 'AI provider'
+        description: "AI provider"
         required: false
-        default: 'claude'
+        default: "claude"
         type: choice
         options: [claude, gemini]
       include_articles:
-        description: 'Include individual article entries below category digests'
+        description: "Include individual article entries below category digests"
         required: false
         default: false
         type: boolean
@@ -36,8 +36,8 @@ jobs:
       # Python 3.10 ships sgmllib in stdlib, which feedparser 6.x requires.
       - uses: actions/setup-python@v5
         with:
-          python-version: '3.10'
-          cache: 'pip'
+          python-version: "3.10"
+          cache: "pip"
 
       - name: Install dependencies
         run: pip install -r requirements.txt
@@ -52,7 +52,7 @@ jobs:
       - name: Resolve run parameters
         run: |
           echo "MODE=${{ inputs.mode || 'weekly' }}" >> "$GITHUB_ENV"
-          echo "AI_PROVIDER=${{ inputs.provider || vars.AI_PROVIDER || 'claude' }}" >> "$GITHUB_ENV"
+          echo "AI_PROVIDER=${{ inputs.provider || vars.AI_PROVIDER || 'gemini' }}" >> "$GITHUB_ENV"
 
       - name: Generate RSS feed
         env:
