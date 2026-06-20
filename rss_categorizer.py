@@ -150,12 +150,12 @@ Analyze the articles below and return a single JSON object with this exact schem
 {
   "categories": {
     "<CategoryName>": {
-      "synthesis": "<2-3 sentence editorial overview of this category: what is happening, what is notable, where articles agree or contradict, and what is most worth reading>",
+      "synthesis": "<prose paragraph, no length limit: name specific people, ideas, and claims; state where sources agree or contradict as plain fact; lead with substance, not framing>",
       "articles": [
         {
           "id": <integer, matches the id field in the input>,
-          "one_line_hook": "<one sentence hook — tells the reader why this piece is worth their time>",
-          "summary": "<prose paragraph of 3-4 sentences covering the key insight, broader context, and main takeaway>",
+          "one_line_hook": "<one sentence stating the article's core claim directly — no 'This article explores', no 'This piece encourages'; lead with the specific content>",
+          "summary": "<prose paragraph of 3-4 sentences: state the claim, the reasoning or evidence, and the conclusion — report the argument, do not describe what the article does>",
           "relevance_tier": <1 | 2>
         }
       ]
@@ -164,13 +164,16 @@ Analyze the articles below and return a single JSON object with this exact schem
 }
 
 Rules:
-• Create at most 8 broad thematic categories. Group related articles together — do NOT create a separate category per article or per source. Aim for 3–15 articles per category.
+• Assign each article to exactly one of these fixed top-level categories — do not invent new labels or sub-categories:
+  Artificial Intelligence, Technology, Software & Programming, Engineering, Science, Space & Astronomy, Environment & Climate, Health & Medicine, Psychology, Philosophy, Arts & Culture, Literature & Writing, Film & Media, Music, History, Geopolitics, Politics, Business & Economics, Finance & Markets, Society, Education, Productivity & Self-Improvement, Design, Sports & Outdoors, Travel, Food
+• Use the closest fit. Anything about AI models, safety, regulation, capabilities, or governance → "Artificial Intelligence". Broader consumer hardware and tech → "Technology". And so on.
+• After assigning all articles, check each category count. Any category with fewer than 3 articles: reassign those articles to the nearest larger category if a reasonable fit exists, otherwise place them in "Other". Never emit a category with only 1 or 2 articles.
 • Each article must appear in exactly one category.
 • relevance_tier: 1 = must-read, 2 = worthwhile. Omit tier-3 (low-priority) articles entirely — do not include them in the articles array at all.
 • Within each category, order articles by relevance_tier ascending (1 first).
-• synthesis: write about the category as a whole, not any single article. Mention notable pieces by name or theme. Note where sources agree or contradict each other.
-• one_line_hook: a hook, not a summary — one sentence that makes the reader want to click.
-• summary: complete sentences only, no bullet points.
+• synthesis: a prose paragraph — no length limit, write as much as the content warrants. Name specific people, ideas, and claims. Do NOT write "This category explores…", "the articles discuss…", "the pieces cover…", or refer to articles by number. Do NOT describe the category itself. State where sources agree or contradict as plain fact. Write as if briefing a knowledgeable friend — lead with substance, not framing. WRONG: "This category delves into AI regulation. Article 1 features concerns from…" RIGHT: "Sam Altman's Senate testimony and EU AI Act coverage converge on liability framing but diverge on timelines — Altman pushed for federal preemption while the EU model imposes obligations before deployment."
+• one_line_hook: state the article's core claim as a direct assertion — never write "This piece encourages readers to…", "This article explores…", "argues that readers should…", or start with "This". State the substance as fact-of-the-argument. WRONG: "This piece encourages readers to reconsider fears about AI by looking to history." RIGHT: "Today's AI panic echoes past reactions to the printing press and electricity — each was predicted to displace human thought and instead expanded it."
+• summary: same principle as one_line_hook, extended to 3-4 sentences. State the claim, the reasoning or evidence, and the conclusion. Never describe what the article does or invites the reader to do — write as if reporting the argument, not reviewing the piece.
 
 Articles:
 """
