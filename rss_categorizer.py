@@ -19,6 +19,7 @@ Environment variables (all overrideable by CLI flags):
 from __future__ import annotations
 
 import argparse
+import concurrent.futures
 import json
 import os
 import re
@@ -143,18 +144,19 @@ SYSTEM_PROMPT = (
     "Respond only with the JSON object requested — no prose, no markdown fences."
 )
 
-_TASK_PROMPT_SCHEMA = """\
+_TASK_PROMPT = """\
 Analyze the articles below and return a single JSON object with this exact schema:
 
 {
   "categories": {
     "<CategoryName>": {
+      "synthesis": "<2-3 sentence editorial overview of this category: what is happening, what is notable, where articles agree or contradict, and what is most worth reading>",
       "articles": [
         {
           "id": <integer, matches the id field in the input>,
-          "summary": "<prose paragraph>",
-          "relevance_tier": <1 | 2 | 3>,
-          "tags": ["<topic>", ...]
+          "one_line_hook": "<one sentence hook — tells the reader why this piece is worth their time>",
+          "summary": "<prose paragraph of 3-4 sentences covering the key insight, broader context, and main takeaway>",
+          "relevance_tier": <1 | 2>
         }
       ]
     }
@@ -164,31 +166,20 @@ Analyze the articles below and return a single JSON object with this exact schem
 Rules:
 • Create at most 8 broad thematic categories. Group related articles together — do NOT create a separate category per article or per source. Aim for 3–15 articles per category.
 • Each article must appear in exactly one category.
-• relevance_tier: 1 = must-read, 2 = worthwhile, 3 = low-priority.
+• relevance_tier: 1 = must-read, 2 = worthwhile. Omit tier-3 (low-priority) articles entirely — do not include them in the articles array at all.
 • Within each category, order articles by relevance_tier ascending (1 first).
-• tags: 3-5 concise topic keywords.
+• synthesis: write about the category as a whole, not any single article. Mention notable pieces by name or theme. Note where sources agree or contradict each other.
+• one_line_hook: a hook, not a summary — one sentence that makes the reader want to click.
+• summary: complete sentences only, no bullet points.
+
+Articles:
 """
-
-# Used by default (category-only mode) — richer prose since this is the only content readers see.
-_TASK_PROMPT_DETAILED = (
-    _TASK_PROMPT_SCHEMA
-    + "• summary: a prose paragraph of 3-4 sentences covering the key insight, broader context, "
-    "and main takeaway. Write in complete sentences — no bullet points.\n\nArticles:\n"
-)
-
-# Used when --include-articles is set — shorter since individual entries also appear.
-_TASK_PROMPT_BRIEF = (
-    _TASK_PROMPT_SCHEMA
-    + "• summary: a prose paragraph of 1-2 sentences capturing the core insight. "
-    "Write in complete sentences — no bullet points.\n\nArticles:\n"
-)
 
 
 _BATCH_CONTENT_CHARS = 800  # per-article content limit inside a batch request
 
 
-def _build_payload(articles: list[dict], detailed: bool = True) -> str:
-    prompt = _TASK_PROMPT_DETAILED if detailed else _TASK_PROMPT_BRIEF
+def _build_payload(articles: list[dict]) -> str:
     items = [
         {
             "id": i,
@@ -198,7 +189,7 @@ def _build_payload(articles: list[dict], detailed: bool = True) -> str:
         }
         for i, a in enumerate(articles)
     ]
-    return prompt + json.dumps(items, ensure_ascii=False, indent=2)
+    return _TASK_PROMPT + json.dumps(items, ensure_ascii=False, indent=2)
 
 
 def _repair_info(text: str, up_to: int) -> tuple[int, str]:
@@ -287,37 +278,47 @@ class AIProvider:
     def _call(self, prompt: str) -> str:
         raise NotImplementedError
 
-    def analyze(self, articles: list[dict], detailed: bool = True) -> dict:
+    def analyze(self, articles: list[dict]) -> dict:
         """
-        Send articles to the model in batches and merge the category results.
+        Send articles to the model in batches concurrently and merge the results.
         Returns the canonical AI result dict: {"categories": {...}}.
         """
-        merged: dict[str, list] = {}
-        id_offset = 0
+        batches = [
+            articles[i : i + self.BATCH_SIZE]
+            for i in range(0, len(articles), self.BATCH_SIZE)
+        ]
+        jobs = [
+            (i * self.BATCH_SIZE, batch, _build_payload(batch))
+            for i, batch in enumerate(batches)
+        ]
 
-        for batch_start in range(0, len(articles), self.BATCH_SIZE):
-            batch = articles[batch_start : batch_start + self.BATCH_SIZE]
-            # Re-index within the batch so IDs start at 0 each time
-            indexed_batch = [dict(a, _batch_idx=i) for i, a in enumerate(batch)]
-            prompt = _build_payload(indexed_batch, detailed=detailed)
-
+        def _run(id_offset: int, batch: list[dict], prompt: str) -> dict:
             try:
                 raw = self._call(prompt)
                 result = _extract_json(raw)
             except Exception as exc:
-                print(f"[warn] AI batch {batch_start}–{batch_start+len(batch)} failed: {exc}", file=sys.stderr)
+                print(
+                    f"[warn] AI batch starting at article {id_offset} failed: {exc}",
+                    file=sys.stderr,
+                )
                 result = {"categories": {}}
+            for cat_data in result.get("categories", {}).values():
+                for art in cat_data.get("articles", []):
+                    art["id"] += id_offset
+            return result
 
-            for cat, cat_data in result.get("categories", {}).items():
-                cat_articles = cat_data.get("articles", [])
-                # Remap batch-local IDs back to global article indices
-                for art in cat_articles:
-                    art["id"] = art["id"] + id_offset
-                merged.setdefault(cat, []).extend(cat_articles)
+        merged: dict[str, dict] = {}
+        with concurrent.futures.ThreadPoolExecutor() as pool:
+            futures = [pool.submit(_run, off, b, p) for off, b, p in jobs]
+            for fut in concurrent.futures.as_completed(futures):
+                for cat, cat_data in fut.result().get("categories", {}).items():
+                    if cat not in merged:
+                        merged[cat] = {"synthesis": "", "articles": []}
+                    merged[cat]["articles"].extend(cat_data.get("articles", []))
+                    if not merged[cat]["synthesis"]:
+                        merged[cat]["synthesis"] = cat_data.get("synthesis", "")
 
-            id_offset += len(batch)
-
-        return {"categories": {k: {"articles": v} for k, v in merged.items()}}
+        return {"categories": merged}
 
 
 class ClaudeProvider(AIProvider):
@@ -388,7 +389,7 @@ def assemble_output(
 ) -> dict:
     """Merge raw article metadata with AI annotations into the final JSON."""
     idx_map = {i: a for i, a in enumerate(articles)}
-    categories: dict[str, list] = {}
+    categories: dict[str, dict] = {}
 
     for cat_name, cat_data in ai.get("categories", {}).items():
         enriched = []
@@ -401,20 +402,23 @@ def assemble_output(
             enriched.append(
                 {
                     "title": orig["title"],
+                    "one_line_hook": ai_art.get("one_line_hook", ""),
                     "summary": ai_art.get("summary", ""),
                     "source": orig["source"],
                     "url": orig["url"],
                     "published": orig["published"],
                     "tags": {
                         "category": cat_name,
-                        "relevance_tier": ai_art.get("relevance_tier", 3),
+                        "relevance_tier": ai_art.get("relevance_tier", 2),
                         "source_feed": orig["source"],
-                        "topics": ai_art.get("tags", []),
                     },
                 }
             )
         if enriched:
-            categories[cat_name] = enriched
+            categories[cat_name] = {
+                "synthesis": cat_data.get("synthesis", ""),
+                "articles": enriched,
+            }
 
     return {
         "mode": mode,
@@ -487,7 +491,10 @@ def build_rss(output: dict, include_articles: bool = False) -> str:
     # ── 1. Category digest entries (one per category) ────────────────────────
     date_label = dr["start"] if mode == "daily" else f"{dr['start']} to {dr['end']}"
 
-    for cat_name, articles in output["categories"].items():
+    for cat_name, cat_data in output["categories"].items():
+        articles = cat_data["articles"]
+        synthesis = cat_data.get("synthesis", "")
+
         item = doc.createElement("item")
         channel.appendChild(item)
 
@@ -497,15 +504,20 @@ def build_rss(output: dict, include_articles: bool = False) -> str:
         _el(doc, item, "category", cat_name)
         _el(doc, item, "dc:creator", "AI Categorizer")
 
-        lines = [f"<h2>{cat_name}</h2>", "<ul>"]
+        lines = [f"<h2>{cat_name}</h2>"]
+        if synthesis:
+            lines.append(f"<p>{synthesis}</p>")
+        lines.append("<ul>")
         for art in articles:
             tier = art["tags"]["relevance_tier"]
             stars = _TIER_STARS.get(tier, "")
+            hook = art.get("one_line_hook", "")
             summary = art.get("summary", "")
             lines.append(
                 f"<li>"
                 f"<strong>{stars} <a href=\"{art['url']}\">{art['title']}</a></strong>"
                 f" &mdash; <em>{art['source']}</em><br/>"
+                f"<em>{hook}</em><br/>"
                 f"{summary}<br/>"
                 f"<a href=\"{art['url']}\">Read more →</a>"
                 f"</li>"
@@ -516,8 +528,8 @@ def build_rss(output: dict, include_articles: bool = False) -> str:
     # ── 2. Individual article entries (only when --include-articles is set) ──
     if include_articles:
         flat: list[tuple[int, str, dict]] = []
-        for cat_name, articles in output["categories"].items():
-            for art in articles:
+        for cat_name, cat_data in output["categories"].items():
+            for art in cat_data["articles"]:
                 flat.append((art["tags"]["relevance_tier"], cat_name, art))
         flat.sort(key=lambda t: t[0])
 
@@ -532,20 +544,20 @@ def build_rss(output: dict, include_articles: bool = False) -> str:
             _el(doc, item, "source", art["source"])
             _el(doc, item, "dc:creator", art["source"])
 
-            # Category tags: detected category, relevance tier, source feed
             _el(doc, item, "category", cat_name)
             _el(doc, item, "category", f"relevance:tier{tier}")
             _el(doc, item, "category", f"source:{art['source']}")
-            for topic in art["tags"].get("topics", []):
-                _el(doc, item, "category", topic)
 
+            hook = art.get("one_line_hook", "")
+            summary = art.get("summary", "")
             desc_html = (
                 f"<p>"
                 f"<strong>Category:</strong> {cat_name} &nbsp;|&nbsp; "
                 f"<strong>Relevance:</strong> {_TIER_LABEL.get(tier, '')} ({_TIER_STARS.get(tier, '')}) &nbsp;|&nbsp; "
                 f"<strong>Source:</strong> {art['source']}"
                 f"</p>"
-                f"<p>{art.get('summary', '')}</p>"
+                f"<p><em>{hook}</em></p>"
+                f"<p>{summary}</p>"
                 f'<p><a href="{art["url"]}">Read full article →</a></p>'
             )
             _html_el(doc, item, "description", desc_html)
@@ -623,7 +635,7 @@ def main() -> None:
     # ── AI analysis ───────────────────────────────────────────────────────────
     provider = make_provider(args.provider)
     print(f"[info] Sending {len(articles)} articles to {args.provider} …", file=sys.stderr)
-    ai_result = provider.analyze(articles, detailed=not args.include_articles)
+    ai_result = provider.analyze(articles)
 
     # ── Assemble JSON output ──────────────────────────────────────────────────
     output = assemble_output(articles, ai_result, args.mode, cutoff, now)

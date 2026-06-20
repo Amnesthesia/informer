@@ -35,23 +35,36 @@ def _slug(text: str) -> str:
     return re.sub(r"[^\w\s-]", "", text.lower()).strip().replace(" ", "-")
 
 
-def _prose_from_html(html: str) -> str:
-    """Extract the prose summary paragraph from an individual article description."""
+def _hook_and_prose_from_html(html: str) -> tuple[str, str]:
+    """Extract (one_line_hook, prose_summary) from an individual article description."""
+    if not html:
+        return "", ""
+    soup = BeautifulSoup(html, "html.parser")
+    hook = ""
+    prose = ""
+    for p in soup.find_all("p"):
+        text = p.get_text(" ", strip=True)
+        if "Category:" in text or "Relevance:" in text:
+            continue
+        if "Read" in text and "article" in text:
+            continue
+        if not hook:
+            em = p.find("em")
+            if em:
+                hook = em.get_text(strip=True)
+                continue
+        if text and not prose:
+            prose = text
+    return hook, prose
+
+
+def _synthesis_from_digest_html(html: str) -> str:
+    """Extract the category synthesis paragraph (the <p> before the <ul>)."""
     if not html:
         return ""
     soup = BeautifulSoup(html, "html.parser")
-    for p in soup.find_all("p"):
-        text = p.get_text(" ", strip=True)
-        # Skip the meta line (contains "Category:" / "Relevance:" / "Source:")
-        if "Category:" in text or "Relevance:" in text:
-            continue
-        # Skip the "Read full article" link paragraph
-        if "Read" in text and "article" in text:
-            continue
-        if text:
-            return text
-    # Fallback: return all text stripped of HTML
-    return soup.get_text(" ", strip=True)
+    p = soup.find("p")
+    return p.get_text(" ", strip=True) if p else ""
 
 
 def _articles_from_digest_html(html: str, cat_name: str) -> list[dict]:
@@ -61,10 +74,12 @@ def _articles_from_digest_html(html: str, cat_name: str) -> list[dict]:
 
     The digest HTML structure (produced by build_rss) is:
         <h2>Category</h2>
+        <p>Synthesis paragraph…</p>
         <ul>
           <li>
-            <strong>★★★ <a href="URL">Title</a></strong> — <em>Source</em><br/>
-            Prose summary...<br/>
+            <strong>★★ <a href="URL">Title</a></strong> — <em>Source</em><br/>
+            <em>One-line hook…</em><br/>
+            Prose summary…<br/>
             <a href="URL">Read more →</a>
           </li>
           ...
@@ -85,10 +100,12 @@ def _articles_from_digest_html(html: str, cat_name: str) -> list[dict]:
         title = a.get_text(strip=True)
         url = a.get("href", "")
 
-        em = li.find("em")
-        source = em.get_text(strip=True) if em else ""
+        # First <em> is the source; second <em> is the one-line hook
+        ems = li.find_all("em")
+        source = ems[0].get_text(strip=True) if ems else ""
+        hook = ems[1].get_text(strip=True) if len(ems) > 1 else ""
 
-        # Stars in the text node determine relevance tier
+        # Stars in the text determine relevance tier
         full_text = li.get_text(" ")
         tier = 3
         if "★★★" in full_text:
@@ -96,8 +113,7 @@ def _articles_from_digest_html(html: str, cat_name: str) -> list[dict]:
         elif "★★" in full_text:
             tier = 2
 
-        # Prose summary: all text in <li> minus the strong (title+stars) and links
-        # Grab text nodes that are direct children of the <li> or its <br/> siblings
+        # Prose summary: strip strong, a, em → remaining text
         for tag in li.find_all(["strong", "a", "em"]):
             tag.decompose()
         prose = li.get_text(" ", strip=True).strip("— ").strip()
@@ -111,6 +127,7 @@ def _articles_from_digest_html(html: str, cat_name: str) -> list[dict]:
                 "category": cat_name,
                 "tier": tier,
                 "topics": [],
+                "hook": hook,
                 "prose": prose,
             }
         )
@@ -151,13 +168,14 @@ def _parse_categories(item: ET.Element) -> tuple[str, int, str, list[str]]:
     return detected, tier, source, topics
 
 
-def parse_feed(path: str) -> tuple[dict, list[dict]]:
+def parse_feed(path: str) -> tuple[dict, list[dict], dict[str, str]]:
     """
     Parse an RSS file produced by rss_categorizer.py.
 
     Returns:
         meta     — channel-level metadata dict
         articles — list of article dicts
+        synths   — map of category name → synthesis paragraph
 
     When the feed contains only category digest items (category-only mode, the
     default), falls back to extracting articles from the digest HTML so the
@@ -185,7 +203,7 @@ def parse_feed(path: str) -> tuple[dict, list[dict]]:
 
         category, tier, source, topics = _parse_categories(item)
         desc_el = item.find("description")
-        prose = _prose_from_html(desc_el.text if desc_el is not None else "")
+        hook, prose = _hook_and_prose_from_html(desc_el.text if desc_el is not None else "")
 
         articles.append(
             {
@@ -196,27 +214,33 @@ def parse_feed(path: str) -> tuple[dict, list[dict]]:
                 "category": category or "Uncategorised",
                 "tier": tier,
                 "topics": topics,
+                "hook": hook,
                 "prose": prose,
             }
         )
 
     # Category-only feed — parse articles out of digest item descriptions
+    synths: dict[str, str] = {}
     if not articles:
         for item in digest_items:
             cat_name = next(
                 (el.text for el in item.findall("category") if el.text), ""
             )
             desc_el = item.find("description")
-            articles.extend(
-                _articles_from_digest_html(desc_el.text or "", cat_name)
-            )
+            html = desc_el.text or ""
+            synths[cat_name] = _synthesis_from_digest_html(html)
+            articles.extend(_articles_from_digest_html(html, cat_name))
 
-    return meta, articles
+    return meta, articles, synths
 
 
 # ─── Markdown rendering ───────────────────────────────────────────────────────
 
-def render_markdown(meta: dict, articles: list[dict]) -> str:
+def render_markdown(
+    meta: dict, articles: list[dict], synths: dict[str, str] | None = None
+) -> str:
+    if synths is None:
+        synths = {}
     if not articles:
         return f"# {meta['title']}\n\n*No articles found.*\n"
 
@@ -253,24 +277,23 @@ def render_markdown(meta: dict, articles: list[dict]) -> str:
         arts = groups[cat]
         lines += [f"## {cat}", ""]
 
+        if synths.get(cat):
+            lines += [synths[cat], ""]
+
         for art in arts:
             badge = _TIER_BADGE.get(art["tier"], "")
 
-            # Article heading as a link
             lines += [f"### [{art['title']}]({art['url']})", ""]
+            lines += [f"**{art['source']}** · {art['published']} · `{badge}`", ""]
 
-            # Meta line
-            lines += [
-                f"**{art['source']}** · {art['published']} · `{badge}`",
-                "",
-            ]
+            hook = art.get("hook", "")
+            if hook:
+                lines += [f"*{hook}*", ""]
 
-            # Prose summary
             prose = art.get("prose", "")
             if prose:
                 lines += [prose, ""]
 
-            # Topic tags
             if art["topics"]:
                 lines += [" ".join(f"`{t}`" for t in art["topics"]), ""]
 
@@ -297,8 +320,8 @@ def main() -> None:
     if not Path(args.feed).exists():
         sys.exit(f"Error: {args.feed} not found.")
 
-    meta, articles = parse_feed(args.feed)
-    md = render_markdown(meta, articles)
+    meta, articles, synths = parse_feed(args.feed)
+    md = render_markdown(meta, articles, synths)
 
     if args.output:
         Path(args.output).write_text(md, encoding="utf-8")
