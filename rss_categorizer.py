@@ -260,7 +260,7 @@ class ClaudeProvider(AIProvider):
 
 
 class GeminiProvider(AIProvider):
-    def __init__(self, model: str = "gemini-1.5-pro") -> None:
+    def __init__(self, model: str = "gemini-2.0-flash") -> None:
         import google.generativeai as genai  # lazy import
 
         api_key = os.environ.get("GOOGLE_API_KEY")
